@@ -161,6 +161,12 @@ namespace ServiceBusDR.Services
                    alias: _alias,
                    new ArmDisasterRecovery() { PartnerNamespace = geo.Partner.Id });
         }
+
+        public async Task ExecuteFailover(GeoNamespace geo)
+        {
+            await _managementClient.DisasterRecoveryConfigs
+                .FailOverAsync(geo.Partner.ResourceGroup, geo.Partner.Name, alias: _alias);
+        }
     }
 
     public interface IGeoService
@@ -170,5 +176,6 @@ namespace ServiceBusDR.Services
         Task TransferMessages(GeoNamespace geo);
         Task<bool> DeleteAllEntities(GeoNamespace geo);
         Task<ArmDisasterRecovery> InitiatePairing(GeoNamespace geo);
+        Task ExecuteFailover(GeoNamespace geo);
     }
 }
