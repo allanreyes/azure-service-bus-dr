@@ -1,143 +1,233 @@
 ﻿using Azure.Core;
 using Azure.Identity;
+using Azure.Messaging.ServiceBus;
 using Azure.Messaging.ServiceBus.Administration;
 using Microsoft.Azure.Management.ServiceBus;
 using Microsoft.Azure.Management.ServiceBus.Models;
 using Microsoft.Rest;
 using SharedConfig;
 
-var adminClient = new ServiceBusAdministrationClient(Constants.GEO_ROOT_MANAGE_CONNECTION);
 // In Visual Studio, go to Tools > Options > Azure Service Authentication > Account Selection
 // to make sure you're using the correct Azure account
-var managementClient = new ServiceBusManagementClient(await GetTokenCredentials())
-{ SubscriptionId = Constants.AZURE_SUBSCRIPTION_ID };
-var clientPrimary = new ServiceBusAdministrationClient(Constants.PRIMARY_ROOT_MANAGE_CONNECTION);
-var clientSecondary = new ServiceBusAdministrationClient(Constants.SECONDARY_ROOT_MANAGE_CONNECTION);
+var cred = new DefaultAzureCredential();
+var adminClient = new ServiceBusAdministrationClient(Constants.ALIAS.ToFQNS(), cred);
+var managementClient = new ServiceBusManagementClient(await GetTokenCredentials(cred));
+managementClient.SubscriptionId = Constants.AZURE_SUBSCRIPTION_ID;
+
 var namespaces = await managementClient.Namespaces.ListAsync();
 
 var sc = StringComparison.InvariantCultureIgnoreCase;
 
 Console.WriteLine("Choose an action:");
-Console.WriteLine("[A] Initiate Pairing");
-Console.WriteLine("[B] Failover");
-Console.WriteLine("[C] Break pairing");
+Console.WriteLine("[A] Get Geo Status");
+Console.WriteLine("[B] Initiate Pairing");
+Console.WriteLine("[C] Failover");
+Console.WriteLine("[D] Failback");
 Console.WriteLine("[Any other key] Count messages");
 
 while (true)
 {
     var key = Console.ReadKey(true).KeyChar;
     var keyPressed = key.ToString().ToUpper();
+    Console.WriteLine($"{new string('-', 10)} {DateTime.Now:yyyy/MM/dd HH:mm:ss} {new string('-', 10)}");
 
     switch (keyPressed)
     {
         case "A":
-            await CreatePairing();
+            await GetGeoRecoveryStatus();
             break;
         case "B":
-            await ExecuteFailover();
+            await CreatePairing();
             break;
         case "C":
-            await BreakPairing();
+            await ExecuteFailover();
+            break;
+        case "D":
+            await ExecuteFailback();
             break;
         default:
-            await CountMessages();
             break;
     }
+}
+
+async Task<ArmDisasterRecovery> GetGeoRecoveryStatus()
+{
+    var geo = await GetGeoNamespace();
+    var pairingStatus = await GetPairingStatus(geo.CurrentResourceGroup, geo.CurrentNameSpace);
+    Console.WriteLine($"Alias               : {pairingStatus.Name}");
+    Console.WriteLine($"Provisioning State  : {pairingStatus.ProvisioningState}");
+    Console.WriteLine($"Primary / Role      : {pairingStatus.Id.Split('/')[8]} / {pairingStatus.Role}");
+
+    var isPaired = !string.IsNullOrEmpty(pairingStatus.PartnerNamespace);
+    if (isPaired)
+    {
+        Console.WriteLine($"Secondary           : {pairingStatus.PartnerNamespace.Split('/').Last()}");
+    }
+    else
+    {
+        Console.WriteLine($"Secondary           : --");
+    }
+    return pairingStatus;
 }
 
 async Task CreatePairing()
 {
     Console.WriteLine("Attempting to create pairing");
-    var geo = await GetGeoNamespace();
+    var pairingStatus = await GetGeoRecoveryStatus();
 
-    Console.WriteLine($"Geo namespace is currently pointing to: {geo.CurrentNameSpace}");
-    Console.WriteLine($"Adding secondary namespace: {geo.PartnerNameSpace}");
-
-    if (await IsPaired(geo.CurrentResourceGroup, geo.CurrentNameSpace))
+    var isPaired = pairingStatus.Role != RoleDisasterRecovery.PrimaryNotReplicating;
+    if (isPaired)
     {
         Console.WriteLine("Already paired. No action performed.");
+        return;
     }
-    else
+
+    var geo = await GetGeoNamespace();
+    Console.WriteLine($"Geo namespace is currently pointing to  : {geo.CurrentNameSpace}");
+    Console.WriteLine($"Adding secondary namespace              : {geo.PartnerNameSpace}");
+
+    await TransferMessages(geo);
+
+    var isEmpty = await DeleteAllEntities(geo);
+    while (!isEmpty)
     {
-        // TODO: Should check and transfer messages first
-        // Partner namespace needs to have no entities before it can be paired
-        await DeleteAllEntities(geo.PartnerResourceGroup, geo.PartnerNameSpace);
-
-        Console.WriteLine("Starting Pairing");
-        var drStatus = await managementClient.DisasterRecoveryConfigs.CreateOrUpdateAsync(
-                geo.CurrentResourceGroup,
-                namespaceName: geo.CurrentNameSpace,
-                alias: Constants.ALIAS,
-                new ArmDisasterRecovery() { PartnerNamespace = geo.PartnerNameSpaceId });
-
-        while (drStatus.ProvisioningState != ProvisioningStateDR.Succeeded)
-        {
-            Console.WriteLine("Waiting for DR to be setup. Current State: " + drStatus.ProvisioningState);
-            await Task.Delay(10000);
-
-            drStatus = await managementClient.DisasterRecoveryConfigs.GetAsync(
-                geo.CurrentResourceGroup,
-                namespaceName: geo.CurrentNameSpace,
-                alias: Constants.ALIAS);
-        }
-        Console.WriteLine("Pairing successful");
+        Console.WriteLine($"Cannot delete entities of '{geo.PartnerNameSpace}' because some subscriptions contain messages");
+        Console.WriteLine($"Transfering messages");
+        await TransferMessages(geo);
+        isEmpty = await DeleteAllEntities(geo);
     }
+
+    Console.WriteLine("Starting Pairing");
+    var drStatus = await managementClient.DisasterRecoveryConfigs.CreateOrUpdateAsync(
+            geo.CurrentResourceGroup,
+            namespaceName: geo.CurrentNameSpace,
+            alias: Constants.ALIAS,
+            new ArmDisasterRecovery() { PartnerNamespace = geo.PartnerNameSpaceId });
+
+    Console.WriteLine($"Waiting for pairing to complete");
+    var status = drStatus.ProvisioningState;
+    while (status != ProvisioningStateDR.Succeeded)
+    {
+        await Task.Delay(15000);
+        status = (await GetPairingStatus(geo.CurrentResourceGroup, geo.CurrentNameSpace)).ProvisioningState;
+        Console.Write(".");
+    }
+
+    Console.WriteLine("Pairing successful");
 }
 
 async Task ExecuteFailover()
 {
     Console.WriteLine("Executing failover");
     var geo = await GetGeoNamespace();
-    await managementClient.DisasterRecoveryConfigs.FailOverAsync(geo.PartnerResourceGroup, geo.PartnerNameSpace, alias: Constants.ALIAS);
-    Console.WriteLine("Failover started");
-    // TODO: Find a way to get status
+    var pairingStatus = await GetPairingStatus(geo.CurrentResourceGroup, geo.CurrentNameSpace);
+    var isPaired = !string.IsNullOrEmpty(pairingStatus.PartnerNamespace);
+    if (!isPaired)
+    {
+        Console.WriteLine($"No pairing detected. Cannot failover.");
+    }
+    else
+    {
+        await managementClient.DisasterRecoveryConfigs.FailOverAsync(geo.PartnerResourceGroup, geo.PartnerNameSpace, alias: Constants.ALIAS);
+
+        Console.WriteLine($"Waiting for Failover to complete.");
+        pairingStatus = (await GetPairingStatus(geo.CurrentResourceGroup, geo.CurrentNameSpace));
+        while (pairingStatus.ProvisioningState != ProvisioningStateDR.Succeeded)
+        {
+            await Task.Delay(15000);
+            // Noticee here we're checking the partner status instead
+            pairingStatus = await GetPairingStatus(geo.PartnerResourceGroup, geo.PartnerNameSpace);
+            Console.Write(".");
+        }
+        Console.WriteLine("Failover completed");
+    }
 }
 
-async Task BreakPairing()
+async Task ExecuteFailback()
 {
-    Console.WriteLine("Breaking pairing");
-    var geo = await GetGeoNamespace();
-    await managementClient.DisasterRecoveryConfigs.BreakPairingAsync(geo.CurrentResourceGroup, geo.CurrentNameSpace, alias: Constants.ALIAS);
-    Console.WriteLine("Break pairing started");
-    // TODO: Find a way to get status
+    Console.WriteLine("Failing back to primary namespace");
+    await CreatePairing(); // Pair with primary
+    await ExecuteFailover(); // Point alias to primary and drop secondary
+    await CreatePairing(); // Pair with secondary
+    Console.WriteLine("Failing back completed");
 }
 
-async Task CountMessages()
+async Task TransferMessages(GeoNamespace geo)
 {
-    var timeStamp = $"{new string('-', 10)}{DateTime.Now.ToString("yyyy/MM/dd HH:mm:ss")}{new string('-', 10)}";
-    var primary = await clientPrimary.GetSubscriptionRuntimePropertiesAsync(Constants.TOPIC_NAME, Constants.SUBSCRIPTION_NAME);
-    var secondary = await clientSecondary.GetSubscriptionRuntimePropertiesAsync(Constants.TOPIC_NAME, Constants.SUBSCRIPTION_NAME);
-    Console.WriteLine(timeStamp);
-    Console.WriteLine($"Canada East (Primary)       : {primary.Value.ActiveMessageCount}");
-    Console.WriteLine($"Canada Central (Secondary)  : {secondary.Value.ActiveMessageCount}");
+    await using var senderClient = new ServiceBusClient($"{geo.CurrentNameSpace}.servicebus.windows.net", credential: cred);
+    await using var receiverClient = new ServiceBusClient($"{geo.PartnerNameSpace}.servicebus.windows.net", credential: cred);
+    var adminClient = new ServiceBusAdministrationClient($"{geo.PartnerNameSpace}.servicebus.windows.net", credential: cred);
+
+    var topics = await managementClient.Topics.ListByNamespaceAsync(geo.PartnerResourceGroup, geo.PartnerNameSpace);
+
+    foreach (var topic in topics)
+    {
+        var sender = senderClient.CreateSender(topic.Name);
+
+        var subscriptions = await managementClient.Subscriptions.ListByTopicAsync(geo.PartnerResourceGroup, geo.PartnerNameSpace, topic.Name);
+        foreach (var subscription in subscriptions)
+        {
+            var subProperties = await adminClient.GetSubscriptionRuntimePropertiesAsync(topic.Name, subscription.Name);
+            var activeMessageCount = subProperties.Value.ActiveMessageCount;
+            if (activeMessageCount > 0)
+            {
+                var receiver = receiverClient.CreateReceiver(topic.Name, subscription.Name);
+                var messages = await receiver.ReceiveMessagesAsync(int.MaxValue);
+                Console.WriteLine($"Received {messages.Count} messages from source subscription '{subscription.Name}' under topic '{topic.Name}' ");
+                foreach (var message in messages)
+                {
+                    await sender.SendMessageAsync(new ServiceBusMessage(message.Body));
+                    await receiver.CompleteMessageAsync(message);
+                }
+                Console.WriteLine($"Copied {messages.Count} messages from source subscription '{subscription.Name}' to target topic '{topic.Name}' ");
+            }
+        }
+    }
 }
 
-async Task<TokenCredentials> GetTokenCredentials()
+async Task<TokenCredentials> GetTokenCredentials(DefaultAzureCredential cred)
 {
-    var cred = new DefaultAzureCredential(new DefaultAzureCredentialOptions());
     var ctx = new TokenRequestContext(scopes: new[] { "https://management.azure.com/.default" });
-    var token = await cred.GetTokenAsync(ctx, default(CancellationToken));
+    var token = await cred.GetTokenAsync(ctx, default);
     return new TokenCredentials(token.Token);
 }
 
-async Task<bool> IsPaired(string resourceGroup, string namespaceName)
+async Task<ArmDisasterRecovery> GetPairingStatus(string resourceGroup, string namespaceName)
 {
-    var pairingStatus = await managementClient.DisasterRecoveryConfigs.GetAsync(
+    return await managementClient.DisasterRecoveryConfigs.GetAsync(
         resourceGroup,
         namespaceName,
         alias: Constants.ALIAS);
-    return pairingStatus.Role != RoleDisasterRecovery.PrimaryNotReplicating;
 }
 
-async Task DeleteAllEntities(string resourceGroup, string namespaceName)
+async Task<bool> DeleteAllEntities(GeoNamespace geo)
 {
     Console.WriteLine("Clearing entities in secondary namespace");
-    var topicsToDelete = await managementClient.Topics.ListByNamespaceAsync(resourceGroup, namespaceName);
+    var adminClient = new ServiceBusAdministrationClient($"{geo.PartnerNameSpace}.servicebus.windows.net", credential: cred);
+
+    var topicsToDelete = await managementClient.Topics.ListByNamespaceAsync(geo.PartnerResourceGroup, geo.PartnerNameSpace);
+    bool hasMessages = false;
     foreach (var topic in topicsToDelete)
     {
-        // TODO: check for messages. Transfer before deleting topic
-        await managementClient.Topics.DeleteAsync(resourceGroup, namespaceName, topic.Name);
+        var subscriptions = await managementClient.Subscriptions.ListByTopicAsync(geo.PartnerResourceGroup, geo.PartnerNameSpace, topic.Name);
+        foreach (var subscription in subscriptions)
+        {
+            var subProperties = await adminClient.GetSubscriptionRuntimePropertiesAsync(topic.Name, subscription.Name);
+            var activeMessageCount = subProperties.Value.ActiveMessageCount;
+            if (activeMessageCount > 0)
+            {
+                Console.WriteLine($"Topic '{topic.Name}' Subscription '{subscription.Name}' has {activeMessageCount} active messages");
+                hasMessages = true;
+            }
+        }
     }
+
+    if (hasMessages) return false;
+
+    foreach (var topic in topicsToDelete)
+        await managementClient.Topics.DeleteAsync(geo.PartnerResourceGroup, geo.PartnerNameSpace, topic.Name);
+
+    return true;
 }
 
 async Task<GeoNamespace> GetGeoNamespace()
@@ -150,17 +240,21 @@ async Task<GeoNamespace> GetGeoNamespace()
     var isUsingPrimary = current.Equals(Constants.PRIMARY_NAMESPACE, sc);
     var partner = isUsingPrimary ? Constants.SECONDARY_NAMESPACE : Constants.PRIMARY_NAMESPACE;
 
-    return new GeoNamespace()
+    var geoNs = new GeoNamespace()
     {
         CurrentNameSpace = current,
-        CurrentNameSpaceId = namespaces?.SingleOrDefault(n => n.Name.Equals(current, sc))?.Id,
-        CurrentResourceGroup = namespaces?.SingleOrDefault(n => n.Name.Equals(current, sc))?.Id.Split('/')[4],
-        PartnerNameSpace = partner,
-        PartnerNameSpaceId = namespaces?.SingleOrDefault(n => n.Name.Equals(partner, sc))?.Id,
-        PartnerResourceGroup = namespaces?.SingleOrDefault(n => n.Name.Equals(partner, sc))?.Id.Split('/')[4],
-        PartnerClient = new ServiceBusAdministrationClient(isUsingPrimary ?
-                        Constants.SECONDARY_ROOT_MANAGE_CONNECTION : Constants.PRIMARY_ROOT_MANAGE_CONNECTION)
+        PartnerNameSpace = partner
     };
+
+    var currentNs = namespaces?.SingleOrDefault(n => n.Name.Equals(current, sc));
+    geoNs.CurrentNameSpaceId = currentNs?.Id;
+    geoNs.CurrentResourceGroup = currentNs?.Id.Split('/')[4];
+
+    var partnerNs = namespaces?.SingleOrDefault(n => n.Name.Equals(partner, sc));
+    geoNs.PartnerNameSpaceId = partnerNs?.Id;
+    geoNs.PartnerResourceGroup = partnerNs?.Id.Split('/')[4];
+
+    return geoNs;
 }
 
 class GeoNamespace
@@ -171,5 +265,4 @@ class GeoNamespace
     public string? PartnerNameSpace { get; set; }
     public string? PartnerNameSpaceId { get; set; }
     public string? PartnerResourceGroup { get; set; }
-    public ServiceBusAdministrationClient? PartnerClient { get; set; }
 }

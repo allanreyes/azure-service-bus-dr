@@ -1,16 +1,17 @@
-﻿using Azure.Messaging.ServiceBus;
+﻿using Azure.Identity;
+using Azure.Messaging.ServiceBus;
 using SharedConfig;
 
-var client = new ServiceBusClient(Constants.GEO_SEND_CONNECTION);
+var cred = new DefaultAzureCredential();
+var client = new ServiceBusClient(Constants.ALIAS.ToFQNS(), credential: cred);
 var sender = client.CreateSender(Constants.TOPIC_NAME);
 
 while (true)
 {
     Console.WriteLine("How many messages to create?");
 
-    var batch = Guid.NewGuid().ToString().Substring(0, 5);
-    int count;
-    if (int.TryParse(Console.ReadLine(), out count))
+    var batch = DateTime.Now.ToString("HHmmss");
+    if (int.TryParse(Console.ReadLine(), out int count))
     {
         for (int i = 0; i < count; i++)
         {
