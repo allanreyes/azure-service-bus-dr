@@ -12,17 +12,19 @@ namespace ServiceBusDR
     public class GetGeoStatus
     {
         private readonly IGeoService _geoService;
+        private readonly ILogger _logger;
 
-        public GetGeoStatus(IGeoService geoService)
+        public GetGeoStatus(IGeoService geoService, ILogger<GetGeoStatus> logger)
         {
             _geoService = geoService;
+            _logger = logger;
         }
 
         [FunctionName(nameof(GetGeoStatus))]
         public async Task<IActionResult> Run(
-            [HttpTrigger(AuthorizationLevel.Function, "get", Route = null)] HttpRequest req,
-            ILogger log)
+            [HttpTrigger(AuthorizationLevel.Function, "get", Route = null)] HttpRequest req)
         {
+            _logger.LogInformation($"Tirggered {nameof(GetGeoStatus)}");
             var geo = await _geoService.GetGeoNamespace();
             var pairingStatus = await _geoService.GetPairingStatus(geo.Current.ResourceGroup, geo.Current.Name);
 

@@ -10,8 +10,6 @@
         public const string TOPIC_NAME = "order-created";
         public const string SUBSCRIPTION_NAME = "local-test";
 
-        public static string ToFQNS(this string sbNamespace)
-            => $"{sbNamespace}.servicebus.windows.net";
 
     }
 }

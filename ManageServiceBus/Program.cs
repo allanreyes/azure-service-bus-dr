@@ -6,6 +6,7 @@ using Microsoft.Azure.Management.ServiceBus;
 using Microsoft.Azure.Management.ServiceBus.Models;
 using Microsoft.Rest;
 using ServiceBusDR.Models;
+using ServiceBusDR.Services;
 using SharedConfig;
 
 // In Visual Studio, go to Tools > Options > Azure Service Authentication > Account Selection

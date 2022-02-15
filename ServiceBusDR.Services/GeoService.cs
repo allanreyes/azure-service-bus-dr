@@ -8,6 +8,10 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Rest;
 using ServiceBusDR.Models;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 
 namespace ServiceBusDR.Services
 {
@@ -33,7 +37,6 @@ namespace ServiceBusDR.Services
             // In Visual Studio, go to Tools > Options > Azure Service Authentication > Account Selection to make sure you're
             // using the correct Azure account, with required role assignment (Azure Service Bus Data Owner)
             _cred = new DefaultAzureCredential();
-
             _adminClient = new ServiceBusAdministrationClient(_alias.ToFQNS(), _cred);
             _managementClient = new ServiceBusManagementClient(GetTokenCredentials(_cred));
             _managementClient.SubscriptionId = config["SubscriptionId"];
@@ -92,35 +95,41 @@ namespace ServiceBusDR.Services
 
         public async Task TransferMessages(GeoNamespace geo)
         {
-            await using var senderClient = new ServiceBusClient($"{geo.Current.Name}.servicebus.windows.net", credential: _cred);
-            await using var receiverClient = new ServiceBusClient($"{geo.Partner.Name}.servicebus.windows.net", credential: _cred);
-            var adminClient = new ServiceBusAdministrationClient($"{geo.Partner.Name}.servicebus.windows.net", credential: _cred);
-
+            var prefetchCount = 100;
+            var adminClient = new ServiceBusAdministrationClient(geo.Partner.Name.ToFQNS(), credential: _cred);
             var topics = await _managementClient.Topics.ListByNamespaceAsync(geo.Partner.ResourceGroup, geo.Partner.Name);
 
-            foreach (var topic in topics)
+            Parallel.ForEach(topics, async topic =>
             {
+                _logger.LogInformation($"Transferring messages into topic '{topic.Name}'");
+                var senderClient = new ServiceBusClient(geo.Current.Name.ToFQNS(), credential: _cred);
                 var sender = senderClient.CreateSender(topic.Name);
 
                 var subscriptions = await _managementClient.Subscriptions.ListByTopicAsync(geo.Partner.ResourceGroup, geo.Partner.Name, topic.Name);
+
                 foreach (var subscription in subscriptions)
                 {
                     var subProperties = await adminClient.GetSubscriptionRuntimePropertiesAsync(topic.Name, subscription.Name);
                     var activeMessageCount = subProperties.Value.ActiveMessageCount;
-                    if (activeMessageCount > 0)
+                    _logger.LogInformation($"Found {activeMessageCount} messages from source subscription '{subscription.Name}' under topic '{topic.Name}' ");
+
+                    if (activeMessageCount == 0) break;
+                    var receiverClient = new ServiceBusClient(geo.Partner.Name.ToFQNS(), credential: _cred);
+
+                    do
                     {
-                        var receiver = receiverClient.CreateReceiver(topic.Name, subscription.Name);
-                        var messages = await receiver.ReceiveMessagesAsync(int.MaxValue);
+                        var receiver = receiverClient.CreateReceiver(topic.Name, subscription.Name, new ServiceBusReceiverOptions() { PrefetchCount = prefetchCount });
+                        var messages = await receiver.ReceiveMessagesAsync(100, TimeSpan.FromSeconds(10));
+                        if (!messages.Any()) break;
+
                         _logger.LogInformation($"Received {messages.Count} messages from source subscription '{subscription.Name}' under topic '{topic.Name}' ");
-                        foreach (var message in messages)
-                        {
-                            await sender.SendMessageAsync(new ServiceBusMessage(message.Body));
-                            await receiver.CompleteMessageAsync(message);
-                        }
+                        await Send(messages, sender, receiver);
                         _logger.LogInformation($"Copied {messages.Count} messages from source subscription '{subscription.Name}' to target topic '{topic.Name}' ");
                     }
+                    while (true);
                 }
-            }
+            });
+
         }
 
         public async Task<bool> DeleteAllEntities(GeoNamespace geo)
@@ -148,7 +157,10 @@ namespace ServiceBusDR.Services
             if (hasMessages) return false;
 
             foreach (var topic in topicsToDelete)
+            {
+                _logger.LogInformation($"Deleting topic '{topic.Name}' from {geo.Partner.Name}");
                 await _managementClient.Topics.DeleteAsync(geo.Partner.ResourceGroup, geo.Partner.Name, topic.Name);
+            }
 
             return true;
         }
@@ -166,6 +178,38 @@ namespace ServiceBusDR.Services
         {
             await _managementClient.DisasterRecoveryConfigs
                 .FailOverAsync(geo.Partner.ResourceGroup, geo.Partner.Name, alias: _alias);
+        }
+
+        private async Task Send(IReadOnlyList<ServiceBusReceivedMessage> messages, ServiceBusSender sender, ServiceBusReceiver receiver)
+        {
+            if (!messages.Any()) return;
+
+            Console.WriteLine($"Sending {messages.Count} messages");
+
+            var batch = await sender.CreateMessageBatchAsync();
+            var index = 0;
+            while (true)
+            {
+                var message = messages.ElementAtOrDefault(index);
+                if (message == null) break;
+
+                if (batch.TryAddMessage(new ServiceBusMessage(message)))
+                {
+                    index++;
+                    var isLastMessage = index == messages.Count;
+
+                    if (!isLastMessage)
+                        continue;
+                }
+
+                await sender.SendMessagesAsync(batch); // Batch is full or end of messages
+                Console.WriteLine($"Sent batch of {batch.Count} messages");
+                batch = await sender.CreateMessageBatchAsync(); // Reset batch            
+            }
+            
+            Console.WriteLine($"Completing {messages.Count} messages");
+            foreach (var message in messages)
+                await receiver.CompleteMessageAsync(message);
         }
     }
 

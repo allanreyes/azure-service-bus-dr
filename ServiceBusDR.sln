@@ -19,9 +19,9 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ManageServiceBus", "ManageS
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ServiceBusDR", "ServiceBusDR\ServiceBusDR.csproj", "{04389D9F-3834-4B6B-AB94-BA14E5911545}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ServiceBusDR.Models", "ServiceBusDR.Models\ServiceBusDR.Models.csproj", "{82147333-9437-45C0-8956-0F5B927EE5C3}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ServiceBusDR.Models", "ServiceBusDR.Models\ServiceBusDR.Models.csproj", "{82147333-9437-45C0-8956-0F5B927EE5C3}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ServiceBusDR.Services", "ServiceBusDR.Services\ServiceBusDR.Services.csproj", "{D70A0B12-FC92-4BDE-A171-3F58EB7A375E}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ServiceBusDR.Services", "ServiceBusDR.Services\ServiceBusDR.Services.csproj", "{D70A0B12-FC92-4BDE-A171-3F58EB7A375E}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
