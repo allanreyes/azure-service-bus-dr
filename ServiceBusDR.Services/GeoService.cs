@@ -54,11 +54,12 @@ namespace ServiceBusDR.Services
             var isUsingPrimary = current.Equals(_primary, sc);
             var partner = isUsingPrimary ? _secondary : _primary;
             var partnerNs = _namespaces?.SingleOrDefault(n => n.Name.Equals(partner, sc));
+            var rgIndex = Array.IndexOf(currentNs?.Id.Split('/'), currentNs?.Id.Split('/').FirstOrDefault(s => s.Trim().Equals("resourceGroups", StringComparison.InvariantCultureIgnoreCase)));
 
             var geoNs = new GeoNamespace()
             {
-                Current = new ServiceBusNamespace(currentNs?.Id, current, currentNs?.Id.Split('/')[4]),
-                Partner = new ServiceBusNamespace(partnerNs?.Id, partner, partnerNs?.Id.Split('/')[4])
+                Current = new ServiceBusNamespace(currentNs?.Id, current, currentNs?.Id.Split('/')[rgIndex + 1]),
+                Partner = new ServiceBusNamespace(partnerNs?.Id, partner, partnerNs?.Id.Split('/')[rgIndex + 1])
             };
 
             return geoNs;
@@ -93,52 +94,33 @@ namespace ServiceBusDR.Services
             return namespacesList;
         }
 
-        public async Task TransferMessages(GeoNamespace geo)
+        public async Task TransferMessages(GeoNamespace geo, string path)
         {
-            var prefetchCount = 300;
-            var adminClient = new ServiceBusAdministrationClient(geo.Partner.Name.ToFQNS(), credential: _cred);
-            var topics = await _managementClient.Topics.ListByNamespaceAsync(geo.Partner.ResourceGroup, geo.Partner.Name);
-
-            Parallel.ForEach(topics, async topic =>
+            var topic = path.Split('/')[0];
+            var subscription = path.Split('/')[1];
+            var senderClient = new ServiceBusClient(geo.Current.Name.ToFQNS(), credential: _cred);
+            var receiverClient = new ServiceBusClient(geo.Partner.Name.ToFQNS(), credential: _cred);
+            var sender = senderClient.CreateSender(topic);
+            var receiver = receiverClient.CreateReceiver(topic, subscription, new ServiceBusReceiverOptions() { PrefetchCount = 300 });
+                
+            do
             {
-                _logger.LogInformation($"Transferring messages into topic '{topic.Name}'");
-                var senderClient = new ServiceBusClient(geo.Current.Name.ToFQNS(), credential: _cred);
-                var sender = senderClient.CreateSender(topic.Name);
+                var messages = await receiver.ReceiveMessagesAsync(100, TimeSpan.FromSeconds(10));
+                if (!messages.Any()) break;
 
-                var subscriptions = await _managementClient.Subscriptions.ListByTopicAsync(geo.Partner.ResourceGroup, geo.Partner.Name, topic.Name);
-
-                foreach (var subscription in subscriptions)
-                {
-                    var subProperties = await adminClient.GetSubscriptionRuntimePropertiesAsync(topic.Name, subscription.Name);
-                    var activeMessageCount = subProperties.Value.ActiveMessageCount;
-                    _logger.LogInformation($"Found {activeMessageCount} messages from source subscription '{subscription.Name}' under topic '{topic.Name}' ");
-
-                    if (activeMessageCount == 0) break;
-                    var receiverClient = new ServiceBusClient(geo.Partner.Name.ToFQNS(), credential: _cred);
-
-                    do
-                    {
-                        var receiver = receiverClient.CreateReceiver(topic.Name, subscription.Name, new ServiceBusReceiverOptions() { PrefetchCount = prefetchCount });
-                        var messages = await receiver.ReceiveMessagesAsync(100, TimeSpan.FromSeconds(10));
-                        if (!messages.Any()) break;
-
-                        _logger.LogInformation($"Received {messages.Count} messages from source subscription '{subscription.Name}' under topic '{topic.Name}' ");
-                        await Send(messages, sender, receiver);
-                        _logger.LogInformation($"Copied {messages.Count} messages from source subscription '{subscription.Name}' to target topic '{topic.Name}' ");
-                    }
-                    while (true);
-                }
-            });
+                _logger.LogInformation($"Copying {messages.Count} messages from source subscription '{subscription}' under topic '{topic}' ");
+                await Send(messages, sender, receiver);
+            }
+            while (true);
         }
 
-        public async Task<bool> DeleteAllEntities(GeoNamespace geo)
+        public async Task<string[]> GetNonEmptyEntities(GeoNamespace geo)
         {
-            // TODO: This deletion only affects topics, not queues yet
-            _logger.LogInformation("Clearing entities in secondary namespace");
+            var result = new List<string>();
             var partnerAdminClient = new ServiceBusAdministrationClient(geo.Partner.Name.ToFQNS(), credential: _cred);
-            var topicsToDelete = await _managementClient.Topics.ListByNamespaceAsync(geo.Partner.ResourceGroup, geo.Partner.Name);
-            bool hasMessages = false;
-            foreach (var topic in topicsToDelete)
+            var topics = await _managementClient.Topics.ListByNamespaceAsync(geo.Partner.ResourceGroup, geo.Partner.Name);
+
+            foreach (var topic in topics)
             {
                 var subscriptions = await _managementClient.Subscriptions.ListByTopicAsync(geo.Partner.ResourceGroup, geo.Partner.Name, topic.Name);
                 foreach (var subscription in subscriptions)
@@ -148,20 +130,21 @@ namespace ServiceBusDR.Services
                     if (activeMessageCount > 0)
                     {
                         _logger.LogInformation($"Topic '{topic.Name}' Subscription '{subscription.Name}' has {activeMessageCount} active messages");
-                        hasMessages = true;
+                        result.Add($"{topic.Name}/{subscription.Name}");
                     }
                 }
             }
+            return result.ToArray();
+        }
 
-            if (hasMessages) return false;
-
+        public async Task DeleteAllEntities(GeoNamespace geo)
+        {
+            var topicsToDelete = await _managementClient.Topics.ListByNamespaceAsync(geo.Partner.ResourceGroup, geo.Partner.Name);
             foreach (var topic in topicsToDelete)
             {
                 _logger.LogInformation($"Deleting topic '{topic.Name}' from {geo.Partner.Name}");
                 await _managementClient.Topics.DeleteAsync(geo.Partner.ResourceGroup, geo.Partner.Name, topic.Name);
             }
-
-            return true;
         }
 
         public async Task<ArmDisasterRecovery> InitiatePairing(GeoNamespace geo)
@@ -223,8 +206,9 @@ namespace ServiceBusDR.Services
     {
         Task<GeoNamespace> GetGeoNamespace();
         Task<ArmDisasterRecovery> GetPairingStatus(string resourceGroup, string namespaceName);
-        Task TransferMessages(GeoNamespace geo);
-        Task<bool> DeleteAllEntities(GeoNamespace geo);
+        Task TransferMessages(GeoNamespace geo, string path);
+        Task<string[]> GetNonEmptyEntities(GeoNamespace geo);
+        Task DeleteAllEntities(GeoNamespace geo);
         Task<ArmDisasterRecovery> InitiatePairing(GeoNamespace geo);
         Task ExecuteFailover(GeoNamespace geo);
     }

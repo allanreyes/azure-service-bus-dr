@@ -11,21 +11,19 @@ namespace ServiceBusDR
     public class Failover
     {
         private readonly IGeoService _geoService;
-        private readonly ILogger _logger;
 
-        public Failover(IGeoService geoService, ILogger<Failover> logger)
+        public Failover(IGeoService geoService)
         {
             _geoService = geoService;
-            _logger = logger;
         }
 
         [FunctionName(nameof(Failover))]
         public async Task<HttpResponseMessage> HttpStart(
             [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestMessage req,
-            [DurableClient] IDurableOrchestrationClient starter)
+            [DurableClient] IDurableOrchestrationClient starter, ILogger logger)
         {
             string instanceId = await starter.StartNewAsync($"{nameof(Failover)}Orchestrator", null);
-            _logger.LogInformation($"Started Failover orchestration with ID = '{instanceId}'.");
+            logger.LogInformation($"Started Failover orchestration with ID = '{instanceId}'.");
             return starter.CreateCheckStatusResponse(req, instanceId);
         }
 

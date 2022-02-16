@@ -11,21 +11,19 @@ namespace ServiceBusDR
     public class InitiatePairing
     {
         private readonly IGeoService _geoService;
-        private readonly ILogger _logger;
 
-        public InitiatePairing(IGeoService geoService, ILogger<InitiatePairing> logger)
+        public InitiatePairing(IGeoService geoService)
         {
             _geoService = geoService;
-            _logger = logger;
         }
 
         [FunctionName(nameof(InitiatePairing))]
         public async Task<HttpResponseMessage> HttpStart(
             [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestMessage req,
-            [DurableClient] IDurableOrchestrationClient starter)
+            [DurableClient] IDurableOrchestrationClient starter, ILogger logger)
         {
             string instanceId = await starter.StartNewAsync($"{nameof(InitiatePairing)}Orchestrator", null);
-            _logger.LogInformation($"Started InitiatePairing orchestration with ID = '{instanceId}'.");
+            logger.LogInformation($"Started InitiatePairing orchestration with ID = '{instanceId}'.");
             return starter.CreateCheckStatusResponse(req, instanceId);
         }
 

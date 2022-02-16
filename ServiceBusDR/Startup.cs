@@ -16,7 +16,7 @@ namespace ServiceBusDR
             var logger = new LoggerConfiguration()
                          .WriteTo.Console()
                          .CreateLogger();
-            builder.Services.AddLogging(lb => lb.AddSerilog(logger));
+            //builder.Services.AddLogging(lb => lb.AddSerilog(logger));
             builder.Services.AddSingleton<IGeoService, GeoService>();
         }
     }

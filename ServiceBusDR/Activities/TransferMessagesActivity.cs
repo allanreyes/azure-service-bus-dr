@@ -1,7 +1,9 @@
 ﻿using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.DurableTask;
 using Microsoft.Extensions.Logging;
+using ServiceBusDR.Models;
 using ServiceBusDR.Services;
+using System;
 using System.Threading.Tasks;
 
 namespace ServiceBusDR
@@ -18,15 +20,11 @@ namespace ServiceBusDR
         }
 
         [FunctionName(nameof(TransferMessagesActivity))]
-        public async Task Run([ActivityTrigger] object input)
+        public async Task Run([ActivityTrigger] Tuple<GeoNamespace, string> input)
         {
             _logger.LogInformation("Transferring messages");
-
-            var geo = await _geoService.GetGeoNamespace();
-            await _geoService.TransferMessages(geo);
-
+            await _geoService.TransferMessages(input.Item1, input.Item2);
             _logger.LogInformation("Message transfer completed");
-
         }
     }
 }
