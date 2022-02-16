@@ -95,7 +95,7 @@ namespace ServiceBusDR.Services
 
         public async Task TransferMessages(GeoNamespace geo)
         {
-            var prefetchCount = 100;
+            var prefetchCount = 300;
             var adminClient = new ServiceBusAdministrationClient(geo.Partner.Name.ToFQNS(), credential: _cred);
             var topics = await _managementClient.Topics.ListByNamespaceAsync(geo.Partner.ResourceGroup, geo.Partner.Name);
 
@@ -129,7 +129,6 @@ namespace ServiceBusDR.Services
                     while (true);
                 }
             });
-
         }
 
         public async Task<bool> DeleteAllEntities(GeoNamespace geo)
@@ -206,10 +205,17 @@ namespace ServiceBusDR.Services
                 Console.WriteLine($"Sent batch of {batch.Count} messages");
                 batch = await sender.CreateMessageBatchAsync(); // Reset batch            
             }
-            
+
             Console.WriteLine($"Completing {messages.Count} messages");
             foreach (var message in messages)
-                await receiver.CompleteMessageAsync(message);
+                try
+                {
+                    await receiver.CompleteMessageAsync(message);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex.Message, ex);
+                }
         }
     }
 
